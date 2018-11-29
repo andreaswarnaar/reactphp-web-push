@@ -15,7 +15,7 @@
   "require": {
     "php": "^7.1",
     "lib-openssl": "*",
-    "guzzlehttp/guzzle": "^6.2",
+    "clue/buzz-react": "^2.5",
     "web-token/jwt-signature": "^1.0",
     "web-token/jwt-key-mgmt": "^1.0"
   },

@@ -14,20 +14,18 @@ declare(strict_types=1);
 namespace Minishlink\WebPush;
 
 use Base64Url\Base64Url;
-use GuzzleHttp\Client;
-use GuzzleHttp\Exception\RequestException;
-use GuzzleHttp\Psr7\Request;
+use Clue\React\Buzz\Browser;
+use Clue\React\Buzz\Message\ResponseException;
 use Psr\Http\Message\ResponseInterface;
+use React\Promise\PromiseInterface;
+use RingCentral\Psr7\Request;
 
 class WebPush
 {
     public const GCM_URL = 'https://android.googleapis.com/gcm/send';
     public const FCM_BASE_URL = 'https://fcm.googleapis.com';
 
-    /**
-     * @var Client
-     */
-    private $client;
+    private $browser;
 
     /**
      * @var array
@@ -35,12 +33,7 @@ class WebPush
     private $auth;
 
     /**
-     * @var null|array Array of array of Notifications
-     */
-    private $notifications;
-
-    /**
-     * @var array Default options : TTL, urgency, topic, batchSize
+     * @var array Default options : TTL, urgency, topic
      */
     private $defaultOptions;
 
@@ -52,17 +45,15 @@ class WebPush
     /**
      * WebPush constructor.
      *
+     * @param Browser  $browser
      * @param array    $auth           Some servers needs authentication
-     * @param array    $defaultOptions TTL, urgency, topic, batchSize
-     * @param int|null $timeout        Timeout of POST request
-     * @param array    $clientOptions
+     * @param array    $defaultOptions TTL, urgency, topic
      *
      * @throws \ErrorException
      */
-    public function __construct(array $auth = [], array $defaultOptions = [], ?int $timeout = 30, array $clientOptions = [])
+    public function __construct(Browser $browser, array $auth = [], array $defaultOptions = [])
     {
         $extensions = [
-            'curl' => '[WebPush] curl extension is not loaded but is required. You can fix this in your php.ini.',
             'gmp' => '[WebPush] gmp extension is not loaded but is required for sending push notifications with payload or for VAPID authentication. You can fix this in your php.ini.',
             'mbstring' => '[WebPush] mbstring extension is not loaded but is required for sending push notifications with payload or for VAPID authentication. You can fix this in your php.ini.',
             'openssl' => '[WebPush] openssl extension is not loaded but is required for sending push notifications with payload or for VAPID authentication. You can fix this in your php.ini.',
@@ -81,31 +72,24 @@ class WebPush
             $auth['VAPID'] = VAPID::validate($auth['VAPID']);
         }
 
+        $this->browser = $browser;
         $this->auth = $auth;
-
         $this->setDefaultOptions($defaultOptions);
-
-        if (!array_key_exists('timeout', $clientOptions) && isset($timeout)) {
-            $clientOptions['timeout'] = $timeout;
-        }
-        $this->client = new Client($clientOptions);
     }
 
     /**
-     * Send a notification.
+     * Send a notification by triggering the WebPush request.
      *
      * @param Subscription $subscription
      * @param string|null $payload If you want to send an array, json_encode it
-     * @param bool $flush If you want to flush directly (usually when you send only one notification)
      * @param array $options Array with several options tied to this notification. If not set, will use the default options that you can set in the WebPush object
      * @param array $auth Use this auth details instead of what you provided when creating WebPush
      *
-     * @return array|bool Return an array of information if $flush is set to true and the queued requests has failed.
-     *                    Else return true
+     * @return PromiseInterface
      *
      * @throws \ErrorException
      */
-    public function sendNotification(Subscription $subscription, ?string $payload = null, bool $flush = false, array $options = [], array $auth = [])
+    public function sendNotification(Subscription $subscription, ?string $payload = null, array $options = [], array $auth = [])
     {
         if (isset($payload)) {
             if (Utils::safeStrlen($payload) > Encryption::MAX_PAYLOAD_LENGTH) {
@@ -119,55 +103,22 @@ class WebPush
             $auth['VAPID'] = VAPID::validate($auth['VAPID']);
         }
 
-        $this->notifications[] = new Notification($subscription, $payload, $options, $auth);
+        // for each endpoint server type
+        $notification = new Notification($subscription, $payload, $options, $auth);
+        $requests = $this->prepare([$notification]);
+        $request = \reset($requests);
 
-	    return false !== $flush ? $this->flush() : true;
-    }
-
-	/**
-	 * Flush notifications. Triggers the requests.
-	 *
-	 * @param null|int $batchSize Defaults the value defined in defaultOptions during instantiation (which defaults to 1000).
-	 *
-	 * @return iterable
-	 * @throws \ErrorException
-	 */
-    public function flush(?int $batchSize = null) : iterable
-    {
-        if (empty($this->notifications)) {
-	        yield from [];
-        }
-
-        if (null === $batchSize) {
-            $batchSize = $this->defaultOptions['batchSize'];
-        }
-
-        $batches = array_chunk($this->notifications, $batchSize);
-
-	    // reset queue
-	    $this->notifications = [];
-
-        foreach ($batches as $batch) {
-	        // for each endpoint server type
-	        $requests = $this->prepare($batch);
-
-	        foreach ($requests as $request) {
-	        	$result = null;
-
-		        $this->client->sendAsync($request)
-			        ->then(function ($response) use ($request, &$result) {
-				        /** @var ResponseInterface $response * */
-				        $result = new MessageSentReport($request, $response);
-			        })
-			        ->otherwise(function ($reason) use (&$result) {
-				        /** @var RequestException $reason **/
-				        $result = new MessageSentReport($reason->getRequest(), $reason->getResponse(), false, $reason->getMessage());
-			        })
-			        ->wait(false);
-
-		        yield $result;
-	        }
-        }
+        return $this->browser->send($request)->then(
+            function (ResponseInterface $response) use ($request) {
+                return new MessageSentReport($request, $response);
+            },
+            function (\Exception $reason) use ($request) {
+                if ($reason instanceof ResponseException) {
+                    return new MessageSentReport($request, $reason->getResponse(), false, $reason->getMessage());
+                }
+                throw $reason;
+            }
+        );
     }
 
     /**
@@ -317,13 +268,12 @@ class WebPush
     }
 
     /**
-     * @param array $defaultOptions Keys 'TTL' (Time To Live, defaults 4 weeks), 'urgency', 'topic', 'batchSize'
+     * @param array $defaultOptions Keys 'TTL' (Time To Live, defaults 4 weeks), 'urgency', 'topic'
      */
     public function setDefaultOptions(array $defaultOptions)
     {
         $this->defaultOptions['TTL'] = isset($defaultOptions['TTL']) ? $defaultOptions['TTL'] : 2419200;
         $this->defaultOptions['urgency'] = isset($defaultOptions['urgency']) ? $defaultOptions['urgency'] : null;
         $this->defaultOptions['topic'] = isset($defaultOptions['topic']) ? $defaultOptions['topic'] : null;
-        $this->defaultOptions['batchSize'] = isset($defaultOptions['batchSize']) ? $defaultOptions['batchSize'] : 1000;
     }
 }

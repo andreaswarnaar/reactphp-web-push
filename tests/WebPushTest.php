@@ -13,6 +13,7 @@ declare(strict_types=1);
 
 use Minishlink\WebPush\WebPush;
 use Minishlink\WebPush\Subscription;
+use Clue\React\Buzz\Browser;
 
 final class WebPushTest extends PHPUnit\Framework\TestCase
 {
@@ -65,7 +66,8 @@ final class WebPushTest extends PHPUnit\Framework\TestCase
             }
         }
 
-        $this->webPush = new WebPush([
+        $browser = $this->createMock(Browser::class);
+        $this->webPush = new WebPush($browser, [
             'GCM' => getenv('GCM_API_KEY'),
             'VAPID' => [
                 'subject' => 'https://github.com/Minishlink/web-push',
